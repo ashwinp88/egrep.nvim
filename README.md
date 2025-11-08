@@ -47,6 +47,10 @@ A beautiful, fast, and feature-rich grep interface for Neovim with folder hierar
 {
   "ashwinp88/egrep.nvim",
   lazy = false,
+  dependencies = {
+    "MunifTanjim/nui.nvim",
+    "nvim-tree/nvim-web-devicons", -- optional
+  },
 
   config = function()
     require("egrep").setup({
@@ -79,6 +83,10 @@ A beautiful, fast, and feature-rich grep interface for Neovim with folder hierar
 ```lua
 use {
   "ashwinp88/egrep.nvim",
+  requires = {
+    "MunifTanjim/nui.nvim",
+    "nvim-tree/nvim-web-devicons", -- optional
+  },
   config = function()
     require("egrep").setup()
   end
@@ -93,6 +101,7 @@ vim.keymap.set("n", "<leader>sW", function() require("egrep").grep_word() end, {
 
 - Neovim >= 0.9.0
 - [ripgrep](https://github.com/BurntSushi/ripgrep) (rg command)
+- [nui.nvim](https://github.com/MunifTanjim/nui.nvim) (for tree UI components)
 - [nvim-web-devicons](https://github.com/nvim-tree/nvim-web-devicons) (optional, for file icons)
 
 ## 🚀 Usage

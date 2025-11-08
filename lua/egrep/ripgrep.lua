@@ -20,12 +20,12 @@ function M.build_command(search_pattern, opts)
     table.insert(cmd, "--ignore-case")
   end
 
-  -- Respect .gitignore
-  if opts.use_gitignore then
-    table.insert(cmd, "--hidden")
-  else
-    table.insert(cmd, "--no-ignore")
+  -- Show hidden files and ignore .gitignore
+  if opts.show_hidden then
+    table.insert(cmd, "--hidden")     -- Show hidden files (dotfiles)
+    table.insert(cmd, "--no-ignore")  -- Ignore .gitignore
   end
+  -- By default, respects .gitignore and hides dotfiles
 
   -- Follow symlinks
   table.insert(cmd, "--follow")
@@ -77,6 +77,9 @@ local function group_by_file(raw_results)
   for _, result in ipairs(raw_results) do
     if result.type == "match" then
       local file = result.data.path.text
+
+      -- Strip leading "./" from paths
+      file = file:gsub("^%./", "")
 
       if not grouped[file] then
         grouped[file] = {

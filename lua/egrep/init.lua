@@ -21,6 +21,11 @@ M.config = {
     width = 0.8,
     height = 0.8,
   },
+  search = {
+    min_chars = 3,           -- Minimum characters before triggering search
+    debounce_ms = 350,       -- Debounce delay for search
+    auto_focus_delay_ms = 500, -- Delay before auto-focusing results
+  },
 }
 
 --- Setup plugin with user configuration
@@ -78,6 +83,7 @@ local function build_search_opts(overrides)
     search_path = current.search_path or ".",
     context_before = current.context_before or 0,
     context_after = current.context_after or 0,
+    show_hidden = false,  -- Default to false
   }
 
   if overrides then
@@ -134,6 +140,7 @@ function M.grep(default_pattern, opts)
     height = math.floor(vim.o.lines * M.config.window.height),
     include_patterns = opts.include_patterns,
     exclude_patterns = opts.exclude_patterns,
+    search_config = M.config.search,
     on_search = function(pattern, search_opts)
       execute_search(pattern, search_opts)
     end,

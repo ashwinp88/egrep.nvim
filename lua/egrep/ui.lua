@@ -1,8 +1,10 @@
 -- Redesigned unified picker UI for enhanced grep with preview pane
 local state = require("egrep.state")
 local patterns = require("egrep.patterns")
+local tree_module = require("egrep.tree")
 
 local M = {}
+
 
 -- UI state
 local ui_state = {
@@ -23,11 +25,10 @@ local ui_state = {
   preview_win = nil,
   -- State tracking
   results = {},
-  file_map = {},
-  match_map = {},
-  folder_map = {},
+  tree = nil,  -- NuiTree instance
   folder_state = {},  -- Track folder expand/collapse
   search_timer = nil,
+  focus_timer = nil,
   current_search = "",
   current_include = "",
   current_exclude = "",
@@ -36,8 +37,10 @@ local ui_state = {
   on_search_callback = nil,
   current_preview_file = nil,
   current_focused_input = nil,
+  search_config = nil,
   -- Options state
   ruby_only = false,
+  show_hidden = false,
 }
 
 -- Icons
@@ -45,8 +48,8 @@ local icons = {
   expanded = "▼",
   collapsed = "▶",
   match = "  ",
-  checked = "",
-  unchecked = "",
+  checked = "[✓]",
+  unchecked = "[ ]",
   folder_open = "",
   folder_closed = "",
 }
@@ -83,6 +86,11 @@ function M.close()
     ui_state.search_timer = nil
   end
 
+  if ui_state.focus_timer then
+    vim.fn.timer_stop(ui_state.focus_timer)
+    ui_state.focus_timer = nil
+  end
+
   -- Clean up autocmd group
   pcall(vim.api.nvim_del_augroup_by_name, "EgrepFocus")
 
@@ -117,9 +125,10 @@ function M.close()
     preview_buf = nil,
     preview_win = nil,
     results = {},
-    file_map = {},
-    match_map = {},
+    tree = nil,
+    folder_state = {},
     search_timer = nil,
+    focus_timer = nil,
     current_search = "",
     current_include = "",
     current_exclude = "",
@@ -128,7 +137,9 @@ function M.close()
     on_search_callback = nil,
     current_preview_file = nil,
     current_focused_input = nil,
+    search_config = nil,
     ruby_only = false,
+    show_hidden = false,
   }
 end
 
@@ -186,7 +197,7 @@ end
 
 --- Update preview based on cursor position
 function M.update_preview_from_cursor()
-  if not ui_state.main_buf or not ui_state.main_win then
+  if not ui_state.main_buf or not ui_state.main_win or not ui_state.tree then
     return
   end
 
@@ -195,215 +206,58 @@ function M.update_preview_from_cursor()
     return
   end
 
-  local ok, cursor = pcall(vim.api.nvim_win_get_cursor, ui_state.main_win)
-  if not ok then
+  -- Get current node from tree
+  local line_num = vim.api.nvim_win_get_cursor(ui_state.main_win)[1]
+  local node = ui_state.tree:get_node(line_num)
+
+  if not node then
     return
   end
 
-  local line = cursor[1]
-
-  -- Check if cursor is on a match line
-  local match_data = ui_state.match_map[line]
-  if match_data then
-    update_preview(match_data.file, match_data.line_number)
-    return
-  end
-
-  -- Check if cursor is on a file line
-  local file_data = ui_state.file_map[line]
-  if file_data then
-    update_preview(file_data.file, nil)
-    return
-  end
-end
-
---- Build folder tree from flat file list
---- @param results table Flat list of file results
---- @return table Tree structure with folders and files
-local function build_folder_tree(results)
-  local tree = {}
-
-  for _, file_data in ipairs(results) do
-    local path = file_data.path
-    local parts = vim.split(path, "/")
-
-    local current = tree
-    local path_so_far = ""
-
-    -- Build folder hierarchy
-    for i = 1, #parts - 1 do
-      local folder = parts[i]
-      path_so_far = path_so_far == "" and folder or (path_so_far .. "/" .. folder)
-
-      if not current[folder] then
-        current[folder] = {
-          type = "folder",
-          name = folder,
-          path = path_so_far,
-          children = {},
-        }
-      end
-      current = current[folder].children
-    end
-
-    -- Add file as leaf
-    local filename = parts[#parts]
-    current[filename] = {
-      type = "file",
-      name = filename,
-      path = path,
-      matches = file_data.matches,
-    }
-  end
-
-  return tree
-end
-
---- Get icon for file using devicons
---- @param filename string File name
---- @return string Icon
-local function get_file_icon(filename)
-  if devicons then
-    local icon, _ = devicons.get_icon(filename, vim.fn.fnamemodify(filename, ":e"), {default = true})
-    return icon or ""
-  end
-  return ""
-end
-
---- Recursively render tree node
---- @param node table Tree node (folder or file)
---- @param indent number Current indentation level
---- @param lines table Lines array to append to
---- @param highlights table Highlights array to append to
-local function render_tree_node(node, indent, lines, highlights, parent_path)
-  local indent_str = string.rep("  ", indent)
-
-  if node.type == "folder" then
-    -- Render folder
-    local is_expanded = ui_state.folder_state[node.path] ~= false  -- Default true
-    local fold_icon = is_expanded and icons.folder_open or icons.folder_closed
-    local line_num = #lines + 1
-    local line_text = string.format("%s%s %s/", indent_str, fold_icon, node.name)
-    table.insert(lines, line_text)
-
-    -- Store folder info
-    ui_state.folder_map[line_num] = {
-      path = node.path,
-      expanded = is_expanded,
-      parent = parent_path,
-      type = "folder",
-    }
-
-    -- Add highlight
-    table.insert(highlights, {
-      line = line_num - 1,
-      col_start = #indent_str,
-      col_end = #line_text,
-      hl_group = "EgrepFile",
-    })
-
-    -- Render children if expanded
-    if is_expanded then
-      -- Sort children: folders first, then files
-      local children = {}
-      for name, child in pairs(node.children) do
-        table.insert(children, {name = name, node = child})
-      end
-      table.sort(children, function(a, b)
-        if a.node.type == b.node.type then
-          return a.name < b.name
-        end
-        return a.node.type == "folder"
-      end)
-
-      for _, child in ipairs(children) do
-        render_tree_node(child.node, indent + 1, lines, highlights, node.path)
-      end
-    end
-
+  -- Check node type and update preview accordingly
+  if node.type == "match" then
+    update_preview(node.file, node.line_number)
   elseif node.type == "file" then
-    -- Render file
-    local saved_fold_state = state.get_fold_state(node.path)
-    local is_expanded = saved_fold_state == true  -- Default false for files
-    local fold_icon = is_expanded and icons.expanded or icons.collapsed
-    local file_icon = get_file_icon(node.name)
-    local line_num = #lines + 1
-    local line_text = string.format("%s%s %s %s (%d)",
-      indent_str, fold_icon, file_icon, node.name, #node.matches)
-    table.insert(lines, line_text)
-
-    -- Store file info
-    ui_state.file_map[line_num] = {
-      file = node.path,
-      expanded = is_expanded,
-      match_count = #node.matches,
-      parent = parent_path,
-      type = "file",
-    }
-
-    -- Add highlight
-    table.insert(highlights, {
-      line = line_num - 1,
-      col_start = #indent_str,
-      col_end = #line_text,
-      hl_group = "EgrepFile",
-    })
-
-    -- Render matches if expanded
-    if is_expanded then
-      for _, match in ipairs(node.matches) do
-        local match_line = #lines + 1
-        local match_text = string.format("%s%sL%d: %s",
-          indent_str .. "  ",
-          icons.match,
-          match.line_number,
-          match.text:gsub("^%s+", ""):gsub("%s+$", "")
-        )
-
-        -- Truncate long lines
-        if #match_text > 100 then
-          match_text = match_text:sub(1, 97) .. "..."
-        end
-
-        table.insert(lines, match_text)
-
-        -- Store match info
-        ui_state.match_map[match_line] = {
-          file = node.path,
-          line_number = match.line_number,
-          column = match.column,
-          parent = node.path,
-        }
-
-        -- Add highlights
-        local line_nr_start = #(indent_str .. "  " .. icons.match)
-        local line_nr_end = line_nr_start + #("L" .. match.line_number .. ": ")
-        table.insert(highlights, {
-          line = match_line - 1,
-          col_start = line_nr_start,
-          col_end = line_nr_end,
-          hl_group = "EgrepLineNr",
-        })
-      end
-    end
+    update_preview(node.path, nil)
+  elseif node.type == "folder" then
+    -- Don't preview folders
+    return
   end
 end
 
---- Render results in main buffer with folder hierarchy
+--- Render results in main buffer with folder hierarchy using NuiTree
 function M.render_results(results)
   if not ui_state.main_buf or not vim.api.nvim_buf_is_valid(ui_state.main_buf) then
     return
   end
 
+  -- Save cursor position and current node path before re-render
+  local saved_cursor_line = nil
+  local saved_node_path = nil
+  local saved_node_type = nil
+
+  if ui_state.main_win and vim.api.nvim_win_is_valid(ui_state.main_win) and ui_state.tree then
+    saved_cursor_line = vim.api.nvim_win_get_cursor(ui_state.main_win)[1]
+
+    -- Get node at current cursor line
+    local current_node = ui_state.tree:get_node(saved_cursor_line)
+
+    if current_node then
+      saved_node_path = current_node.path or current_node.file
+      saved_node_type = current_node.type
+
+      local logfile = io.open("/tmp/egrep_restore.log", "a")
+      if logfile then
+        logfile:write(string.format("[SAVE] Line %d: path='%s' type='%s'\n",
+          saved_cursor_line, saved_node_path, saved_node_type))
+        logfile:close()
+      end
+    end
+  end
+
   ui_state.results = results or {}
-  ui_state.file_map = {}
-  ui_state.match_map = {}
-  ui_state.folder_map = {}
 
-  local lines = {}
-  local highlights = {}
-
-  -- Results header
+  -- Calculate totals
   local total_files = #ui_state.results
   local total_matches = 0
   for _, file_data in ipairs(ui_state.results) do
@@ -411,141 +265,285 @@ function M.render_results(results)
   end
 
   if total_files == 0 then
-    table.insert(lines, "No results found")
-    table.insert(lines, "")
-    table.insert(lines, "Try adjusting your search pattern or filters")
+    -- No results
+    vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", true)
+    vim.api.nvim_buf_set_lines(ui_state.main_buf, 0, -1, false, {
+      "No results found",
+      "",
+      "Try adjusting your search pattern or filters"
+    })
+    vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", false)
+    ui_state.tree = nil
   else
-    table.insert(lines, string.format("Results: %d files, %d matches", total_files, total_matches))
-    table.insert(lines, "")
+    -- Create NuiTree instance and render
+    if ui_state.main_win and vim.api.nvim_win_is_valid(ui_state.main_win) then
+      -- Clear buffer and prepare for new render
+      vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", true)
+      vim.api.nvim_buf_set_lines(ui_state.main_buf, 0, -1, false, {})
 
-    -- Build and render tree
-    local tree = build_folder_tree(ui_state.results)
+      -- Create and render tree
+      ui_state.tree = tree_module.create_tree(ui_state.results, ui_state.main_win, ui_state.folder_state)
+      ui_state.tree:render()
 
-    -- Sort root level nodes
-    local root_nodes = {}
-    for name, node in pairs(tree) do
-      table.insert(root_nodes, {name = name, node = node})
-    end
-    table.sort(root_nodes, function(a, b)
-      if a.node.type == b.node.type then
-        return a.name < b.name
-      end
-      return a.node.type == "folder"
-    end)
+      -- Lock buffer but keep it non-readonly (to allow programmatic changes)
+      vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", false)
+      vim.api.nvim_buf_set_option(ui_state.main_buf, "readonly", false)
 
-    -- Render each root node
-    for _, item in ipairs(root_nodes) do
-      render_tree_node(item.node, 0, lines, highlights, nil)
-    end
-  end
+      -- Restore cursor position after re-render
+      vim.schedule(function()
+        if not vim.api.nvim_win_is_valid(ui_state.main_win) then
+          return
+        end
 
-  -- Set buffer lines
-  vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(ui_state.main_buf, 0, -1, false, lines)
-  vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", false)
+        if saved_node_path and ui_state.tree then
+          local logfile = io.open("/tmp/egrep_restore.log", "a")
+          if logfile then
+            logfile:write(string.format("\n[RESTORE] Looking for: path='%s' type='%s'\n", saved_node_path, saved_node_type))
+          end
 
-  -- Apply highlights
-  local ns_id = vim.api.nvim_create_namespace("egrep")
-  vim.api.nvim_buf_clear_namespace(ui_state.main_buf, ns_id, 0, -1)
+          -- Try to find the same node and position cursor there
+          local found = false
+          local max_line = vim.api.nvim_buf_line_count(ui_state.main_buf)
+          if logfile then
+            logfile:write(string.format("[RESTORE] Max lines: %d\n", max_line))
+          end
 
-  for _, hl in ipairs(highlights) do
-    if hl.line >= 0 and hl.line < #lines then
-      pcall(vim.api.nvim_buf_add_highlight,
-        ui_state.main_buf,
-        ns_id,
-        hl.hl_group,
-        hl.line,
-        hl.col_start,
-        hl.col_end
-      )
+          -- Search all lines for matching node
+          for line_num = 1, max_line do
+            -- Get node at this line
+            local node = ui_state.tree:get_node(line_num)
+
+            -- Check if this is the node we're looking for
+            if node then
+              local node_path = node.path or node.file
+              if logfile then
+                logfile:write(string.format("[RESTORE] Line %d: path='%s' type='%s' | Match: %s\n",
+                  line_num, node_path or "nil", node.type,
+                  tostring(node_path == saved_node_path and node.type == saved_node_type)))
+              end
+
+              if node_path == saved_node_path and node.type == saved_node_type then
+                -- Found it! Set cursor to this line
+                vim.api.nvim_win_set_cursor(ui_state.main_win, {line_num, 0})
+                if logfile then
+                  logfile:write(string.format("[RESTORE] MATCH at line %d\n", line_num))
+                end
+                found = true
+                break
+              end
+            else
+              if logfile then
+                logfile:write(string.format("[RESTORE] Line %d: NO NODE\n", line_num))
+              end
+            end
+          end
+
+          if not found then
+            if logfile then
+              logfile:write("[RESTORE] NOT FOUND - using fallback\n")
+            end
+          end
+
+          -- If node not found, try to restore approximate line position
+          if not found and saved_cursor_line then
+            local target_line = math.max(saved_cursor_line, 1)
+            target_line = math.min(target_line, max_line)
+            if logfile then
+              logfile:write(string.format("[RESTORE] Fallback to line %d\n", target_line))
+            end
+            vim.api.nvim_win_set_cursor(ui_state.main_win, {target_line, 0})
+          end
+
+          if logfile then
+            logfile:close()
+          end
+        elseif saved_cursor_line then
+          -- No saved node path, just restore approximate line
+          local max_line = vim.api.nvim_buf_line_count(ui_state.main_buf)
+          local target_line = math.max(saved_cursor_line, 1)
+          target_line = math.min(target_line, max_line)
+          vim.api.nvim_win_set_cursor(ui_state.main_win, {target_line, 0})
+        else
+          -- No saved position, put cursor on first line
+          vim.api.nvim_win_set_cursor(ui_state.main_win, {1, 0})
+        end
+
+        -- Force update preview after cursor restore
+        M.update_preview_from_cursor()
+      end)
     end
   end
 end
 
---- Toggle fold at cursor (Right arrow = expand, works for folders and files)
+--- Right arrow: expand if collapsed, move to first child if expanded
 function M.toggle_fold()
-  if not ui_state.main_buf then
+  if not ui_state.tree then
     return
   end
 
-  local cursor = vim.api.nvim_win_get_cursor(ui_state.main_win)
-  local line = cursor[1]
+  local line_num = vim.api.nvim_win_get_cursor(ui_state.main_win)[1]
+  local node = ui_state.tree:get_node(line_num)
 
-  -- Check if it's a folder
-  local folder_data = ui_state.folder_map[line]
-  if folder_data then
-    ui_state.folder_state[folder_data.path] = not folder_data.expanded
-    M.render_results(ui_state.results)
+  if not node then
     return
   end
 
-  -- Check if it's a file
-  local file_data = ui_state.file_map[line]
-  if file_data then
-    state.toggle_fold_state(file_data.file)
-    M.render_results(ui_state.results)
-    return
+  -- Handle based on node type and expansion state
+  if node.type == "folder" or node.type == "file" then
+    if node:is_expanded() then
+      -- Already expanded, move to first child
+      local child_ids = node:get_child_ids()
+      if child_ids and #child_ids > 0 then
+        -- Get current cursor position
+        local cursor = vim.api.nvim_win_get_cursor(ui_state.main_win)
+        local current_line = cursor[1]
+
+        -- Move cursor down one line (to first child)
+        vim.api.nvim_win_set_cursor(ui_state.main_win, {current_line + 1, 0})
+        M.update_preview_from_cursor()
+      end
+    else
+      -- Collapsed, expand it
+      if node.type == "folder" then
+        -- Just update state - don't call node:expand()
+        -- Let render_results() rebuild the tree with proper expansion
+        ui_state.folder_state[node.path] = true
+      else -- file
+        state.set_fold_state(node.path, true)
+      end
+      M.render_results(ui_state.results)
+    end
   end
 end
 
---- Collapse parent (Left arrow = collapse parent from child)
+--- Left arrow: collapse and move to parent based on node type
 function M.collapse_parent()
-  if not ui_state.main_buf then
+  if not ui_state.tree then
     return
   end
 
-  local cursor = vim.api.nvim_win_get_cursor(ui_state.main_win)
-  local line = cursor[1]
+  local line_num = vim.api.nvim_win_get_cursor(ui_state.main_win)[1]
+  local node = ui_state.tree:get_node(line_num)
 
-  -- If on a match, collapse the parent file
-  local match_data = ui_state.match_map[line]
-  if match_data and match_data.parent then
-    state.set_fold_state(match_data.parent, false)
-    M.render_results(ui_state.results)
+  if not node then
     return
   end
 
-  -- If on a file, collapse the parent folder
-  local file_data = ui_state.file_map[line]
-  if file_data and file_data.parent then
-    ui_state.folder_state[file_data.parent] = false
-    M.render_results(ui_state.results)
+  -- Helper function to move cursor to parent node
+  local function move_to_parent()
+    local parent_id = node:get_parent_id()
+    if not parent_id then
+      return false
+    end
+
+    local parent_node = ui_state.tree:get_node(parent_id)
+    if not parent_node then
+      return false
+    end
+
+    -- Find the line number of the parent node
+    local lines = vim.api.nvim_buf_get_lines(ui_state.main_buf, 0, -1, false)
+    for line_num = 1, #lines do
+      local line_node = ui_state.tree:get_node(line_num)
+      if line_node and line_node:get_id() == parent_id then
+        vim.api.nvim_win_set_cursor(ui_state.main_win, {line_num, 0})
+        M.update_preview_from_cursor()
+        return true
+      end
+    end
+    return false
+  end
+
+  -- Match node: collapse parent file and move to it
+  if node.type == "match" then
+    local parent_id = node:get_parent_id()
+    if parent_id then
+      local parent_node = ui_state.tree:get_node(parent_id)
+      if parent_node and parent_node.type == "file" then
+        -- Collapse the file
+        state.set_fold_state(parent_node.path, false)
+        M.render_results(ui_state.results)
+        -- Move to the file after re-render
+        vim.schedule(function()
+          move_to_parent()
+        end)
+      end
+    end
     return
   end
 
-  -- If on a folder, collapse it
-  local folder_data = ui_state.folder_map[line]
-  if folder_data then
-    ui_state.folder_state[folder_data.path] = false
-    M.render_results(ui_state.results)
-    return
+  -- File or Folder node
+  if node.type == "folder" or node.type == "file" then
+    -- If expanded: collapse it
+    if node:is_expanded() then
+      if node.type == "folder" then
+        -- Just update state - don't call node:collapse()
+        ui_state.folder_state[node.path] = false
+      else -- file
+        state.set_fold_state(node.path, false)
+      end
+      M.render_results(ui_state.results)
+    else
+      -- If collapsed: collapse parent and move to it
+      local parent_id = node:get_parent_id()
+      if parent_id then
+        local parent_node = ui_state.tree:get_node(parent_id)
+        if parent_node then
+          -- Collapse parent - just update state
+          if parent_node.type == "folder" then
+            ui_state.folder_state[parent_node.path] = false
+          elseif parent_node.type == "file" then
+            state.set_fold_state(parent_node.path, false)
+          end
+          M.render_results(ui_state.results)
+          -- Move to parent after re-render
+          vim.schedule(function()
+            move_to_parent()
+          end)
+        end
+      end
+    end
   end
 end
 
---- Jump to match or file under cursor
+--- Jump to match or file under cursor, or toggle folder
 function M.jump_to_match()
-  if not ui_state.main_buf then
+  if not ui_state.tree then
     return
   end
 
-  local cursor = vim.api.nvim_win_get_cursor(ui_state.main_win)
-  local line = cursor[1]
+  local line_num = vim.api.nvim_win_get_cursor(ui_state.main_win)[1]
+  local node = ui_state.tree:get_node(line_num)
+
+  if not node then
+    return
+  end
+
+  -- Check if it's a folder - toggle expand/collapse
+  if node.type == "folder" then
+    -- Just update state - don't call node methods
+    if node:is_expanded() then
+      ui_state.folder_state[node.path] = false
+    else
+      ui_state.folder_state[node.path] = true
+    end
+    M.render_results(ui_state.results)
+    return
+  end
 
   -- Check if it's a match
-  local match_data = ui_state.match_map[line]
-  if match_data then
+  if node.type == "match" then
     M.close()
-    vim.cmd("edit " .. vim.fn.fnameescape(match_data.file))
-    vim.api.nvim_win_set_cursor(0, {match_data.line_number, match_data.column})
+    vim.cmd("edit " .. vim.fn.fnameescape(node.file))
+    vim.api.nvim_win_set_cursor(0, {node.line_number, node.column})
     vim.cmd("normal! zz")
     return
   end
 
   -- Check if it's a file
-  local file_data = ui_state.file_map[line]
-  if file_data then
+  if node.type == "file" then
     M.close()
-    vim.cmd("edit " .. vim.fn.fnameescape(file_data.file))
+    vim.cmd("edit " .. vim.fn.fnameescape(node.path))
     return
   end
 end
@@ -623,6 +621,7 @@ function M.next_input()
     vim.api.nvim_set_current_win(ui_state.exclude_win)
     vim.cmd("startinsert!")
   elseif current_win == ui_state.exclude_win then
+    vim.cmd("stopinsert")  -- Exit insert mode before moving to results
     vim.api.nvim_set_current_win(ui_state.main_win)
   else
     vim.api.nvim_set_current_win(ui_state.input_win)
@@ -646,6 +645,10 @@ function M.prev_input()
   elseif current_win == ui_state.input_win then
     vim.api.nvim_set_current_win(ui_state.exclude_win)
     vim.cmd("startinsert!")
+  elseif current_win == ui_state.main_win then
+    -- Going back from results to input
+    vim.api.nvim_set_current_win(ui_state.exclude_win)
+    vim.cmd("startinsert!")
   else
     vim.api.nvim_set_current_win(ui_state.input_win)
     vim.cmd("startinsert!")
@@ -666,7 +669,7 @@ function M.toggle_no_tests()
 
   render_options()
   if ui_state.current_search ~= "" then
-    trigger_search()
+    trigger_search(true)  -- Force search since toggles changed
   end
 end
 
@@ -679,7 +682,7 @@ function M.toggle_ruby_only()
 
   render_options()
   if ui_state.current_search ~= "" then
-    trigger_search()
+    trigger_search(true)  -- Force search since toggles changed
   end
 end
 
@@ -689,7 +692,16 @@ function M.toggle_case_sensitive()
   state.update({case_sensitive = not current.case_sensitive})
   render_options()
   if ui_state.current_search ~= "" then
-    trigger_search()
+    trigger_search(true)  -- Force search since toggles changed
+  end
+end
+
+--- Toggle show hidden files
+function M.toggle_show_hidden()
+  ui_state.show_hidden = not ui_state.show_hidden
+  render_options()
+  if ui_state.current_search ~= "" then
+    trigger_search(true)  -- Force search since toggles changed
   end
 end
 
@@ -703,12 +715,14 @@ render_options = function()
   local no_tests_icon = current.ignore_tests and icons.checked or icons.unchecked
   local ruby_only_icon = ui_state.ruby_only and icons.checked or icons.unchecked
   local case_icon = current.case_sensitive and icons.checked or icons.unchecked
+  local hidden_icon = ui_state.show_hidden and icons.checked or icons.unchecked
 
   local line = string.format(
-    " %s No Tests (F1)   %s Ruby Only (F2)   %s Case Sensitive (F3)   Help (?)",
+    " %s No Tests (F1)   %s Ruby Only (F2)   %s Case Sensitive (F3)   %s Show Hidden (F4)   Help (?)",
     no_tests_icon,
     ruby_only_icon,
-    case_icon
+    case_icon,
+    hidden_icon
   )
 
   vim.api.nvim_buf_set_option(ui_state.options_buf, "modifiable", true)
@@ -727,8 +741,10 @@ function M.show_help()
     "  <CR>           - Execute search and focus results",
     "",
     "Results Navigation:",
-    "  <CR>           - Jump to match under cursor",
-    "  <Right>/<Left> - Expand/collapse fold for file",
+    "  <CR>           - Jump to match/file or toggle folder",
+    "  <Double-Click> - Jump to match/file or toggle folder",
+    "  <Right>        - Expand (if collapsed) or move to first child",
+    "  <Left>         - Collapse (if expanded) or move to parent",
     "  za             - Toggle fold",
     "  zR             - Expand all folds",
     "  zM             - Collapse all folds",
@@ -738,6 +754,7 @@ function M.show_help()
     "  F1             - Toggle 'No Tests' filter",
     "  F2             - Toggle 'Ruby Only' filter",
     "  F3             - Toggle case sensitivity",
+    "  F4             - Toggle show hidden/git-ignored files",
     "",
     "Actions:",
     "  <C-q>          - Send to quickfix list",
@@ -756,7 +773,8 @@ function M.show_help()
 end
 
 --- Trigger search from inputs
-trigger_search = function()
+--- @param force boolean|nil Force search even if inputs haven't changed
+trigger_search = function(force)
   if not ui_state.input_buf or not vim.api.nvim_buf_is_valid(ui_state.input_buf) then
     return
   end
@@ -784,8 +802,8 @@ trigger_search = function()
     exclude_str = (exclude_lines[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
   end
 
-  -- Check if anything changed
-  if pattern == prev_search and include_str == prev_include and exclude_str == prev_exclude then
+  -- Check if anything changed (unless force is true)
+  if not force and pattern == prev_search and include_str == prev_include and exclude_str == prev_exclude then
     return
   end
 
@@ -831,19 +849,80 @@ trigger_search = function()
     ui_state.on_search_callback(pattern, {
       include_patterns = final_include,
       exclude_patterns = final_exclude,
+      show_hidden = ui_state.show_hidden,
     })
   end
 end
 
---- Debounced search trigger
+--- Auto-focus results window
+local function auto_focus_results()
+  if ui_state.main_win and vim.api.nvim_win_is_valid(ui_state.main_win) then
+    vim.cmd("stopinsert")
+    vim.api.nvim_set_current_win(ui_state.main_win)
+    update_input_highlights()
+  end
+end
+
+--- Debounced search trigger with min chars check
 local function trigger_search_debounced()
+  -- Stop existing timers
   if ui_state.search_timer then
     vim.fn.timer_stop(ui_state.search_timer)
+    ui_state.search_timer = nil
+  end
+  if ui_state.focus_timer then
+    vim.fn.timer_stop(ui_state.focus_timer)
+    ui_state.focus_timer = nil
   end
 
-  ui_state.search_timer = vim.fn.timer_start(300, function()
-    vim.schedule(trigger_search)
-  end)
+  -- Get current search pattern to check length
+  if not ui_state.input_buf or not vim.api.nvim_buf_is_valid(ui_state.input_buf) then
+    return
+  end
+
+  local pattern_lines = vim.api.nvim_buf_get_lines(ui_state.input_buf, 1, 2, false)
+  local pattern = (pattern_lines[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
+
+  local min_chars = ui_state.search_config and ui_state.search_config.min_chars or 3
+  local debounce_ms = ui_state.search_config and ui_state.search_config.debounce_ms or 350
+  local auto_focus_delay_ms = ui_state.search_config and ui_state.search_config.auto_focus_delay_ms or 500
+
+  -- Only trigger search if we have minimum characters
+  if #pattern >= min_chars then
+    -- Schedule search after debounce delay
+    ui_state.search_timer = vim.fn.timer_start(debounce_ms, function()
+      vim.schedule(trigger_search)
+    end)
+
+    -- Schedule auto-focus after longer delay
+    ui_state.focus_timer = vim.fn.timer_start(auto_focus_delay_ms, function()
+      vim.schedule(auto_focus_results)
+    end)
+  elseif #pattern == 0 then
+    -- Clear results immediately if pattern is empty
+    vim.schedule(function()
+      M.render_results({})
+    end)
+  end
+end
+
+--- Trigger search and focus immediately (for Enter key)
+local function trigger_search_and_focus()
+  -- Stop existing timers
+  if ui_state.search_timer then
+    vim.fn.timer_stop(ui_state.search_timer)
+    ui_state.search_timer = nil
+  end
+  if ui_state.focus_timer then
+    vim.fn.timer_stop(ui_state.focus_timer)
+    ui_state.focus_timer = nil
+  end
+
+  -- Trigger search immediately
+  trigger_search()
+
+  -- Focus results immediately
+  auto_focus_results()
 end
 
 --- Set up keymaps for input buffers
@@ -853,13 +932,7 @@ local function setup_input_keymaps(buf)
     {"i", "<S-Tab>", M.prev_input, {desc = "Previous input"}},
     {"i", "<C-n>", M.next_input, {desc = "Next input"}},
     {"i", "<C-p>", M.prev_input, {desc = "Previous input"}},
-    {"i", "<CR>", function()
-      trigger_search()
-      vim.cmd("stopinsert")
-      vim.api.nvim_set_current_win(ui_state.main_win)
-      update_input_highlights()
-      vim.schedule(function() vim.cmd("redraw") end)
-    end, {desc = "Search and focus results"}},
+    {"i", "<CR>", trigger_search_and_focus, {desc = "Search and focus results"}},
     {"i", "<Esc>", function()
       M.close()
     end, {desc = "Close"}},
@@ -879,6 +952,8 @@ local function setup_input_keymaps(buf)
     {"i", "<F2>", M.toggle_ruby_only, {desc = "Toggle Ruby only"}},
     {"n", "<F3>", M.toggle_case_sensitive, {desc = "Toggle case sensitive"}},
     {"i", "<F3>", M.toggle_case_sensitive, {desc = "Toggle case sensitive"}},
+    {"n", "<F4>", M.toggle_show_hidden, {desc = "Toggle show hidden"}},
+    {"i", "<F4>", M.toggle_show_hidden, {desc = "Toggle show hidden"}},
   }
 
   for _, keymap in ipairs(keymaps) do
@@ -896,6 +971,7 @@ function M.create_picker(opts)
   ui_state.include_patterns = opts.include_patterns or saved_state.last_include or {}
   ui_state.exclude_patterns = opts.exclude_patterns or saved_state.last_exclude or {}
   ui_state.on_search_callback = opts.on_search
+  ui_state.search_config = opts.search_config
 
   -- Calculate dimensions
   local total_width = opts.width or math.floor(vim.o.columns * 0.9)
@@ -907,7 +983,7 @@ function M.create_picker(opts)
   local input_section_height = 11  -- 3 input windows (2 lines + border) + 1 options window = 11
   local results_height = total_height - input_section_height
   local results_width = math.floor(total_width * 0.5)
-  local preview_width = total_width - results_width - 1  -- -1 for border
+  local preview_width = total_width - results_width - 4  -- -4 for both sets of borders (2 each)
 
   -- Create search pattern buffer with label line
   ui_state.input_buf = vim.api.nvim_create_buf(false, true)
@@ -947,13 +1023,18 @@ function M.create_picker(opts)
   -- Create main results buffer
   ui_state.main_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_option(ui_state.main_buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(ui_state.main_buf, "buftype", "nofile")
   vim.api.nvim_buf_set_option(ui_state.main_buf, "filetype", "egrep")
   vim.api.nvim_buf_set_option(ui_state.main_buf, "modifiable", false)
+  vim.api.nvim_buf_set_option(ui_state.main_buf, "swapfile", false)
+  vim.api.nvim_buf_set_option(ui_state.main_buf, "readonly", false)
 
   -- Create preview buffer
   ui_state.preview_buf = vim.api.nvim_create_buf(false, true)
   vim.api.nvim_buf_set_option(ui_state.preview_buf, "bufhidden", "wipe")
+  vim.api.nvim_buf_set_option(ui_state.preview_buf, "buftype", "nofile")
   vim.api.nvim_buf_set_option(ui_state.preview_buf, "modifiable", false)
+  vim.api.nvim_buf_set_option(ui_state.preview_buf, "swapfile", false)
 
   -- Create input windows with proper borders (now 2 lines high with labels)
   -- Search Pattern window
@@ -1010,7 +1091,7 @@ function M.create_picker(opts)
     row = row + input_section_height,
     col = col,
     style = "minimal",
-    border = {"╭", "─", "┬", "│", "╰", "─", "┴", "│"},
+    border = {"╭", "─", "╮", "│", "╰", "─", "╯", "│"},
     title = " Results ",
     title_pos = "center",
   })
@@ -1021,9 +1102,9 @@ function M.create_picker(opts)
     width = preview_width,
     height = results_height,
     row = row + input_section_height,
-    col = col + results_width + 1,
+    col = col + results_width + 2,  -- +2 for left border of results and spacing
     style = "minimal",
-    border = {"┬", "─", "╮", "│", "┴", "─", "╯", "│"},
+    border = {"╭", "─", "╮", "│", "╰", "─", "╯", "│"},
     title = " Preview ",
     title_pos = "center",
   })
@@ -1084,28 +1165,84 @@ function M.create_picker(opts)
 
   -- Set up main buffer keymaps
   local main_keymaps = {
-    {"n", "<CR>", M.jump_to_match, {desc = "Jump to match or open file"}},
-    {"n", "<2-LeftMouse>", M.jump_to_match, {desc = "Double-click to open"}},
-    {"n", "<LeftMouse>", function()
-      local mouse_pos = vim.fn.getmousepos()
-      if mouse_pos.winid == ui_state.main_win then
-        vim.api.nvim_win_set_cursor(ui_state.main_win, {mouse_pos.line, mouse_pos.column - 1})
-      end
-    end, {desc = "Click to navigate"}},
-    {"n", "<Right>", M.toggle_fold, {desc = "Expand folder/file"}},
-    {"n", "<Left>", M.collapse_parent, {desc = "Collapse parent"}},
-    {"n", "za", M.toggle_fold, {desc = "Toggle fold"}},
-    {"n", "zR", M.expand_all, {desc = "Expand all"}},
-    {"n", "zM", M.collapse_all, {desc = "Collapse all"}},
+    {"n", "<CR>", M.jump_to_match, {desc = "Jump to match/file or toggle folder"}},
     {"n", "i", function()
       vim.api.nvim_set_current_win(ui_state.input_win)
       vim.cmd("startinsert!")
       update_input_highlights()
       vim.schedule(function() vim.cmd("redraw") end)
     end, {desc = "Edit search"}},
+    {"n", "a", function() end, {desc = "Disabled"}},
+    {"n", "A", function() end, {desc = "Disabled"}},
+    {"n", "I", function() end, {desc = "Disabled"}},
+    {"n", "o", function() end, {desc = "Disabled"}},
+    {"n", "O", function() end, {desc = "Disabled"}},
+    {"n", "<2-LeftMouse>", function()
+      -- Exit insert mode if in input fields
+      vim.cmd("stopinsert")
+
+      local mouse_pos = vim.fn.getmousepos()
+      if mouse_pos.winid == ui_state.main_win then
+        -- Set focus to results window
+        vim.api.nvim_set_current_win(ui_state.main_win)
+        vim.api.nvim_win_set_cursor(ui_state.main_win, {mouse_pos.line, mouse_pos.column - 1})
+        update_input_highlights()
+
+        if not ui_state.tree then
+          return
+        end
+
+        local node = ui_state.tree:get_node(mouse_pos.line)
+
+        if not node then
+          return
+        end
+
+        -- Double-click on match: preview it
+        if node.type == "match" then
+          update_preview(node.file, node.line_number)
+        -- Double-click on file/folder: toggle expand
+        elseif node.type == "file" or node.type == "folder" then
+          M.toggle_fold()
+        end
+      end
+    end, {desc = "Double-click to toggle or preview"}},
+    {"n", "<LeftMouse>", function()
+      -- Exit insert mode if in input fields
+      vim.cmd("stopinsert")
+
+      local mouse_pos = vim.fn.getmousepos()
+      if mouse_pos.winid == ui_state.main_win then
+        -- Set focus to results window
+        vim.api.nvim_set_current_win(ui_state.main_win)
+        vim.api.nvim_win_set_cursor(ui_state.main_win, {mouse_pos.line, mouse_pos.column - 1})
+        update_input_highlights()
+
+        if not ui_state.tree then
+          return
+        end
+
+        local node = ui_state.tree:get_node(mouse_pos.line)
+
+        if not node then
+          return
+        end
+
+        -- Single click on file/folder: expand it
+        if node.type == "file" or node.type == "folder" then
+          M.toggle_fold()
+        end
+      end
+    end, {desc = "Click to navigate and expand"}},
+    {"n", "<Right>", M.toggle_fold, {desc = "Expand folder/file"}},
+    {"n", "<Left>", M.collapse_parent, {desc = "Collapse parent"}},
+    {"n", "za", M.toggle_fold, {desc = "Toggle fold"}},
+    {"n", "zR", M.expand_all, {desc = "Expand all"}},
+    {"n", "zM", M.collapse_all, {desc = "Collapse all"}},
     {"n", "<F1>", M.toggle_no_tests, {desc = "Toggle no tests filter"}},
     {"n", "<F2>", M.toggle_ruby_only, {desc = "Toggle Ruby only"}},
     {"n", "<F3>", M.toggle_case_sensitive, {desc = "Toggle case sensitive"}},
+    {"n", "<F4>", M.toggle_show_hidden, {desc = "Toggle show hidden"}},
     {"n", "?", M.show_help, {desc = "Show help"}},
     {"n", "q", M.close, {desc = "Close"}},
     {"n", "<Esc>", M.close, {desc = "Close"}},
