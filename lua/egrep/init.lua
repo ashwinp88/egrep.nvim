@@ -26,12 +26,15 @@ M.config = {
     debounce_ms = 350,       -- Debounce delay for search
     auto_focus_delay_ms = 500, -- Delay before auto-focusing results
   },
+  ui = {},
 }
 
 --- Setup plugin with user configuration
 --- @param user_config table|nil User configuration
 function M.setup(user_config)
   M.config = vim.tbl_deep_extend("force", M.config, user_config or {})
+
+  ui.setup_ui(M.config.ui)
 
   -- Update default state with config
   local current_state = state.get()
@@ -141,6 +144,7 @@ function M.grep(default_pattern, opts)
     include_patterns = opts.include_patterns,
     exclude_patterns = opts.exclude_patterns,
     search_config = M.config.search,
+    layout = M.config.ui and M.config.ui.layout,
     on_search = function(pattern, search_opts)
       execute_search(pattern, search_opts)
     end,
