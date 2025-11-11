@@ -107,6 +107,9 @@ local function execute_search(pattern, opts)
   -- Build search options
   local search_opts = build_search_opts(opts)
 
+  local backend_cmd_table = ripgrep.build_command(pattern, search_opts)
+  ui.set_backend_command(table.concat(backend_cmd_table, " "))
+
   -- Execute search
   ripgrep.search(pattern, search_opts, function(result)
     vim.schedule(function()
@@ -250,6 +253,43 @@ function M.select_preset()
       M.grep_with_preset(choice.key)
     end
   end)
+end
+
+--- Expose UI toggle functions for programmatic use
+
+--- Toggle include filter input visibility
+function M.toggle_include()
+  require("egrep.ui").toggle_include()
+end
+
+--- Toggle exclude filter input visibility
+function M.toggle_exclude()
+  require("egrep.ui").toggle_exclude()
+end
+
+--- Toggle test file exclusion
+function M.toggle_no_tests()
+  require("egrep.ui").toggle_no_tests()
+end
+
+--- Toggle Ruby-only filter
+function M.toggle_ruby_only()
+  require("egrep.ui").toggle_ruby_only()
+end
+
+--- Toggle case-sensitive search
+function M.toggle_case_sensitive()
+  require("egrep.ui").toggle_case_sensitive()
+end
+
+--- Toggle show hidden files
+function M.toggle_show_hidden()
+  require("egrep.ui").toggle_show_hidden()
+end
+
+--- Show help window
+function M.show_help()
+  require("egrep.ui").show_help()
 end
 
 return M

@@ -18,11 +18,13 @@ local ui_state = {
   include_win = nil,
   exclude_buf = nil,
   exclude_win = nil,
-  -- Options and preview windows
-  options_buf = nil,
-  options_win = nil,
+  -- Status and preview windows
+  status_buf = nil,
+  status_win = nil,
   preview_buf = nil,
   preview_win = nil,
+  help_buf = nil,
+  help_win = nil,
   -- State tracking
   results = {},
   tree = nil,  -- NuiTree instance
@@ -50,6 +52,8 @@ local ui_state = {
   origin_win = nil,
   is_closing = false,
   suppress_close_watch = false,
+  input_prefixes = {},
+  backend_command = nil,
 }
 
 -- Icons
@@ -64,6 +68,7 @@ local icons = {
 }
 
 local DEFAULT_UI_CONFIG = {
+  enable_default_keymaps = true,  -- Set to false to disable all default keybindings
   keymaps = {
     focus_search = "<F1>",
     toggle_include = "<F2>",
@@ -75,10 +80,9 @@ local DEFAULT_UI_CONFIG = {
     show_help = "?",
   },
   layout = {
-    results_ratio = 0.55,
+    results_ratio = 0.5,
     horizontal_gap = 1,
     vertical_gap = 0,
-    options_height = 2,
     min_results_height = 10,
   },
 }
@@ -104,6 +108,127 @@ end
 
 local FLOAT_BORDER = {"╭", "─", "╮", "│", "╯", "─", "╰", "│"}
 
+local function str_width(text)
+  if not text or text == "" then
+    return 0
+  end
+  return vim.fn.strdisplaywidth(text)
+end
+
+local function shorten_text(text, max_width)
+  if not text or text == "" then
+    return ""
+  end
+  if not max_width or max_width <= 0 then
+    return ""
+  end
+  if str_width(text) <= max_width then
+    return text
+  end
+  if max_width <= 3 then
+    return text:sub(1, max_width)
+  end
+  return text:sub(1, max_width - 3) .. "..."
+end
+
+local function format_input_prefix(label)
+  return string.format("  %-8s┃ ", label)
+end
+
+local function set_input_buffer_content(buf, label, value)
+  local prefix = format_input_prefix(label)
+  ui_state.input_prefixes[buf] = {label = label, prefix = prefix}
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, {prefix .. value})
+end
+
+local function ensure_input_prefix(buf)
+  local info = ui_state.input_prefixes[buf]
+  if not info or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local prefix = info.prefix
+  local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+  if line:sub(1, #prefix) ~= prefix then
+    local suffix
+    local idx = line:find(prefix, 1, true)
+    if idx then
+      suffix = line:sub(idx + #prefix)
+    else
+      suffix = line:gsub("^%s+", "")
+    end
+    vim.api.nvim_buf_set_lines(buf, 0, -1, false, {prefix .. suffix})
+  end
+end
+
+local function clamp_input_cursor(buf)
+  local info = ui_state.input_prefixes[buf]
+  if not info then return end
+  local prefix_len = #info.prefix
+  for _, win in ipairs(vim.fn.win_findbuf(buf)) do
+    if vim.api.nvim_win_is_valid(win) then
+      local pos = vim.api.nvim_win_get_cursor(win)
+      if pos[1] == 1 and pos[2] < prefix_len then
+        vim.api.nvim_win_set_cursor(win, {1, prefix_len})
+      end
+    end
+  end
+end
+
+local function attach_input_behavior(buf)
+  local info = ui_state.input_prefixes[buf]
+  if not info then return end
+  local group = vim.api.nvim_create_augroup("EgrepInput" .. buf, {clear = true})
+
+  vim.api.nvim_create_autocmd({"BufEnter", "WinEnter"}, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      clamp_input_cursor(buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({"CursorMoved", "CursorMovedI"}, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      clamp_input_cursor(buf)
+    end,
+  })
+
+  vim.api.nvim_create_autocmd({"TextChanged", "TextChangedI"}, {
+    group = group,
+    buffer = buf,
+    callback = function()
+      ensure_input_prefix(buf)
+      clamp_input_cursor(buf)
+    end,
+  })
+end
+
+local function get_input_value(buf)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return ""
+  end
+  local info = ui_state.input_prefixes[buf]
+  local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+  local prefix = info and info.prefix or ""
+  local value = line
+  if prefix ~= "" and line:sub(1, #prefix) == prefix then
+    value = line:sub(#prefix + 1)
+  end
+  return value:gsub("^%s+", ""):gsub("%s+$", "")
+end
+
+local function move_input_cursor_to_end(buf, win)
+  if not buf or not vim.api.nvim_buf_is_valid(buf) then
+    return
+  end
+  local line = vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or ""
+  if win and vim.api.nvim_win_is_valid(win) then
+    vim.api.nvim_win_set_cursor(win, {1, #line})
+  end
+end
+
 -- Try to load devicons
 local has_devicons, devicons = pcall(require, "nvim-web-devicons")
 if not has_devicons then
@@ -114,23 +239,39 @@ end
 local function setup_highlights()
   vim.api.nvim_set_hl(0, "EgrepFile", {link = "Directory", default = true})
   vim.api.nvim_set_hl(0, "EgrepMatch", {link = "String", default = true})
-  vim.api.nvim_set_hl(0, "EgrepLineNr", {link = "LineNr", default = true})
+  vim.api.nvim_set_hl(0, "EgrepLineNr", {link = "Comment", default = true})
   vim.api.nvim_set_hl(0, "EgrepIcon", {link = "Special", default = true})
   vim.api.nvim_set_hl(0, "EgrepCount", {link = "Number", default = true})
   vim.api.nvim_set_hl(0, "EgrepPrompt", {link = "Title", default = true})
   vim.api.nvim_set_hl(0, "EgrepBorder", {link = "FloatBorder", default = true})
   vim.api.nvim_set_hl(0, "EgrepPreviewHighlight", {link = "CursorLine", default = true})
-  vim.api.nvim_set_hl(0, "EgrepActiveInput", {link = "CursorLine", default = true})
-  vim.api.nvim_set_hl(0, "EgrepInactiveInput", {link = "Normal", default = true})
+  vim.api.nvim_set_hl(0, "EgrepActiveInput", {link = "NormalFloat", default = true})
+  vim.api.nvim_set_hl(0, "EgrepInactiveInput", {link = "NormalFloat", default = true})
   vim.api.nvim_set_hl(0, "EgrepSeparator", {link = "Comment", default = true})
   vim.api.nvim_set_hl(0, "EgrepCursorLine", {link = "Visual", default = false})
+  vim.api.nvim_set_hl(0, "EgrepStatus", {link = "StatusLine", default = true})
+  vim.api.nvim_set_hl(0, "EgrepGuide", {link = "Comment", default = true})
+  vim.api.nvim_set_hl(0, "EgrepMatchText", {link = "Normal", default = true})
+  vim.api.nvim_set_hl(0, "EgrepMatchHighlight", {link = "Search", default = true})
+  vim.api.nvim_set_hl(0, "EgrepSpacer", {link = "NormalFloat", default = true})
 end
 
--- Forward declarations
 local trigger_search
-local render_options
+local render_status_line
+local close_help_window
 
 --- Close the picker
+local function close_help_window()
+  if ui_state.help_win and vim.api.nvim_win_is_valid(ui_state.help_win) then
+    pcall(vim.api.nvim_win_close, ui_state.help_win, true)
+  end
+  if ui_state.help_buf and vim.api.nvim_buf_is_valid(ui_state.help_buf) then
+    pcall(vim.api.nvim_buf_delete, ui_state.help_buf, {force = true})
+  end
+  ui_state.help_buf = nil
+  ui_state.help_win = nil
+end
+
 function M.close()
   ui_state.is_closing = true
 
@@ -157,7 +298,7 @@ function M.close()
     ui_state.input_win,
     ui_state.include_win,
     ui_state.exclude_win,
-    ui_state.options_win,
+    ui_state.status_win,
     ui_state.main_win,
     ui_state.preview_win,
     ui_state.spacer_win,
@@ -169,6 +310,8 @@ function M.close()
     end
   end
 
+  close_help_window()
+
   if ui_state.spacer_buf and vim.api.nvim_buf_is_valid(ui_state.spacer_buf) then
     pcall(vim.api.nvim_buf_delete, ui_state.spacer_buf, {force = true})
   end
@@ -177,9 +320,10 @@ function M.close()
     ui_state.input_buf,
     ui_state.include_buf,
     ui_state.exclude_buf,
-    ui_state.options_buf,
+    ui_state.status_buf,
     ui_state.main_buf,
     ui_state.preview_buf,
+    ui_state.help_buf,
   }
 
   for _, buf in ipairs(buffers) do
@@ -198,10 +342,12 @@ function M.close()
     include_win = nil,
     exclude_buf = nil,
     exclude_win = nil,
-    options_buf = nil,
-    options_win = nil,
+    status_buf = nil,
+    status_win = nil,
     preview_buf = nil,
     preview_win = nil,
+    help_buf = nil,
+    help_win = nil,
     results = {},
     tree = nil,
     folder_state = {},
@@ -227,6 +373,8 @@ function M.close()
     origin_win = nil,
     is_closing = false,
     suppress_close_watch = false,
+    input_prefixes = {},
+    backend_command = nil,
   }
 end
 
@@ -240,8 +388,14 @@ local function update_preview(file, line_number)
 
   if not file or file == "" then
     vim.api.nvim_buf_set_option(ui_state.preview_buf, "modifiable", true)
-    vim.api.nvim_buf_set_lines(ui_state.preview_buf, 0, -1, false, {"No preview available"})
+    vim.api.nvim_buf_set_lines(ui_state.preview_buf, 0, -1, false, {"Select a match to preview the file context here."})
     vim.api.nvim_buf_set_option(ui_state.preview_buf, "modifiable", false)
+    if ui_state.preview_win and vim.api.nvim_win_is_valid(ui_state.preview_win) then
+      local cfg = vim.api.nvim_win_get_config(ui_state.preview_win)
+      cfg.title = " Preview "
+      cfg.title_pos = "left"
+      vim.api.nvim_win_set_config(ui_state.preview_win, cfg)
+    end
     return
   end
 
@@ -253,6 +407,12 @@ local function update_preview(file, line_number)
     vim.api.nvim_buf_set_option(ui_state.preview_buf, "modifiable", true)
     vim.api.nvim_buf_set_lines(ui_state.preview_buf, 0, -1, false, {"Error reading file: " .. file})
     vim.api.nvim_buf_set_option(ui_state.preview_buf, "modifiable", false)
+    if ui_state.preview_win and vim.api.nvim_win_is_valid(ui_state.preview_win) then
+      local cfg = vim.api.nvim_win_get_config(ui_state.preview_win)
+      cfg.title = string.format(" Preview ─ %s ─", vim.fn.fnamemodify(file, ":~"))
+      cfg.title_pos = "left"
+      vim.api.nvim_win_set_config(ui_state.preview_win, cfg)
+    end
     return
   end
 
@@ -279,6 +439,21 @@ local function update_preview(file, line_number)
     local ns_id = vim.api.nvim_create_namespace("egrep_preview")
     vim.api.nvim_buf_clear_namespace(ui_state.preview_buf, ns_id, 0, -1)
     vim.api.nvim_buf_add_highlight(ui_state.preview_buf, ns_id, "EgrepPreviewHighlight", line_number - 1, 0, -1)
+  elseif ui_state.preview_win and vim.api.nvim_win_is_valid(ui_state.preview_win) then
+    local ns_id = vim.api.nvim_create_namespace("egrep_preview")
+    vim.api.nvim_buf_clear_namespace(ui_state.preview_buf, ns_id, 0, -1)
+  end
+
+  if ui_state.preview_win and vim.api.nvim_win_is_valid(ui_state.preview_win) then
+    local cfg = vim.api.nvim_win_get_config(ui_state.preview_win)
+    local path = vim.fn.fnamemodify(file, ":~")
+    if line_number then
+      cfg.title = string.format(" Preview ─ %s:%d ─", path, line_number)
+    else
+      cfg.title = string.format(" Preview ─ %s ─", path)
+    end
+    cfg.title_pos = "left"
+    vim.api.nvim_win_set_config(ui_state.preview_win, cfg)
   end
 end
 
@@ -646,21 +821,17 @@ local function update_input_highlights()
   -- Update window highlights based on focus
   if ui_state.input_win and vim.api.nvim_win_is_valid(ui_state.input_win) then
     local hl = current_win == ui_state.input_win and "EgrepActiveInput" or "EgrepInactiveInput"
-    -- Include FloatBorder and FloatTitle to preserve title rendering
-    vim.api.nvim_win_set_option(ui_state.input_win, "winhl",
-      "Normal:" .. hl .. ",FloatBorder:FloatBorder,FloatTitle:FloatTitle")
+    vim.api.nvim_win_set_option(ui_state.input_win, "winhl", "Normal:" .. hl)
   end
 
   if ui_state.include_win and vim.api.nvim_win_is_valid(ui_state.include_win) then
     local hl = current_win == ui_state.include_win and "EgrepActiveInput" or "EgrepInactiveInput"
-    vim.api.nvim_win_set_option(ui_state.include_win, "winhl",
-      "Normal:" .. hl .. ",FloatBorder:FloatBorder,FloatTitle:FloatTitle")
+    vim.api.nvim_win_set_option(ui_state.include_win, "winhl", "Normal:" .. hl)
   end
 
   if ui_state.exclude_win and vim.api.nvim_win_is_valid(ui_state.exclude_win) then
     local hl = current_win == ui_state.exclude_win and "EgrepActiveInput" or "EgrepInactiveInput"
-    vim.api.nvim_win_set_option(ui_state.exclude_win, "winhl",
-      "Normal:" .. hl .. ",FloatBorder:FloatBorder,FloatTitle:FloatTitle")
+    vim.api.nvim_win_set_option(ui_state.exclude_win, "winhl", "Normal:" .. hl)
   end
 end
 
@@ -677,6 +848,7 @@ local function focus_search_input()
     ui_state.manual_input_focus = false
     vim.api.nvim_set_current_win(ui_state.input_win)
     vim.cmd("startinsert!")
+    move_input_cursor_to_end(ui_state.input_buf, ui_state.input_win)
     update_input_highlights()
   end
 end
@@ -692,7 +864,8 @@ end
 
 local function map_config_key(modes, key_name, handler, opts)
   local key = get_keymap(key_name)
-  if not key or key == "" then return end
+  -- Support false or "" to disable specific keybinding
+  if not key or key == "" or key == false then return end
   local mode_list = type(modes) == "table" and modes or {modes}
   opts = opts or {}
   for _, mode in ipairs(mode_list) do
@@ -705,43 +878,60 @@ local function compute_layout_sections()
   if not layout then return nil end
 
   local sections = {}
-  local row_cursor = layout.row
   local gap = layout.vertical_gap or 0
+  local row = layout.row
+  local col = layout.col
+  local width = layout.width
 
-  local function place_section(height)
-    local section = {
-      row = row_cursor,
-      col = layout.col,
-      width = layout.width,
-      height = height,
+  local function assign_section(name)
+    sections[name] = {
+      row = row,
+      col = col,
+      width = width,
+      height = 1,
     }
-    row_cursor = row_cursor + height + 2 + gap
-    return section
+    row = row + 1 + gap
   end
 
-  local search_height = layout.search_height or 2
-  local filter_height = layout.filter_height or search_height
-  local options_height = layout.options_height or 2
-
-  sections.search = place_section(search_height)
+  assign_section('search')
 
   if ui_state.include_visible then
-    sections.include = place_section(filter_height)
+    assign_section('include')
   end
 
   if ui_state.exclude_visible then
-    sections.exclude = place_section(filter_height)
+    assign_section('exclude')
   end
 
-  sections.options = place_section(options_height)
+  local status_height = 1
+  local status_row = layout.row + layout.height - status_height
+  if status_row <= row then
+    status_row = row + status_height + gap
+  end
 
-  local remaining = layout.height - (row_cursor - layout.row)
-  if remaining < 0 then remaining = 0 end
-  local available_height = math.max(remaining, 1)
-  local results_height = available_height
+  sections.status = {
+    row = status_row,
+    col = col,
+    width = width,
+    height = status_height,
+  }
+
+  local available = status_row - row - gap
+  if available < 5 then
+    available = 5
+  end
+
+  local results_height = available - 2 -- account for border
+  local min_results_height = layout.min_results_height or 10
+  if results_height < min_results_height then
+    results_height = math.max(min_results_height, available - 2)
+  end
+  if results_height < 3 then
+    results_height = 3
+  end
 
   local gap_x = layout.horizontal_gap or 0
-  local content_width = layout.width - gap_x - 2
+  local content_width = width - gap_x - 4  -- Account for borders on both results and preview panes (2+2)
   if content_width < 2 then content_width = 2 end
 
   local results_ratio = layout.results_ratio or 0.5
@@ -758,25 +948,27 @@ local function compute_layout_sections()
   end
 
   sections.results = {
-    row = row_cursor,
-    col = layout.col,
+    row = row,
+    col = col,
     width = results_width,
     height = results_height,
   }
 
   sections.preview = {
-    row = row_cursor,
-    col = layout.col + results_width + 2 + gap_x,
+    row = row,
+    col = col + results_width + 2 + gap_x,
     width = preview_width,
     height = results_height,
   }
 
   if gap_x > 0 then
+    local spacer_row = row - 1
+    if spacer_row < 0 then spacer_row = 0 end
     sections.spacer = {
-      row = row_cursor,
-      col = layout.col + results_width + 2,
+      row = spacer_row,
+      col = col + results_width + 2,
       width = gap_x,
-      height = results_height,
+      height = results_height + 3,  -- +3 because spacer starts 1 row above + 2 borders
     }
   end
 
@@ -815,6 +1007,14 @@ local function ensure_window(win_field, buf_field, section, opts)
     config.title_pos = opts.title_pos or "center"
   end
 
+  if opts.focusable ~= nil then
+    config.focusable = opts.focusable
+  end
+
+  if opts.zindex then
+    config.zindex = opts.zindex
+  end
+
   if win and vim.api.nvim_win_is_valid(win) then
     vim.api.nvim_win_set_config(win, config)
   else
@@ -833,7 +1033,7 @@ local function ensure_window(win_field, buf_field, section, opts)
   end
 end
 
-local function ensure_spacer(section)
+local function ensure_spacer(section, max_height)
   if not section or section.width <= 0 then
     if ui_state.spacer_win and vim.api.nvim_win_is_valid(ui_state.spacer_win) then
       pcall(vim.api.nvim_win_close, ui_state.spacer_win, true)
@@ -851,19 +1051,29 @@ local function ensure_spacer(section)
     vim.api.nvim_buf_set_option(ui_state.spacer_buf, "bufhidden", "wipe")
   end
 
+  local height = section.height
+  if max_height and max_height > 0 then
+    height = math.min(height, max_height)
+  end
+  if height < 1 then
+    height = 1
+  end
+
   local filler = string.rep(" ", section.width)
   local lines = {}
-  for _ = 1, section.height do
+  for _ = 1, height do
     table.insert(lines, filler)
   end
+  vim.api.nvim_buf_set_option(ui_state.spacer_buf, "modifiable", true)
   vim.api.nvim_buf_set_lines(ui_state.spacer_buf, 0, -1, false, lines)
+  vim.api.nvim_buf_set_option(ui_state.spacer_buf, "modifiable", false)
 
   local config = {
     relative = "editor",
     row = section.row,
     col = section.col,
     width = section.width,
-    height = section.height,
+    height = height,
     style = "minimal",
     border = "none",
   }
@@ -874,7 +1084,8 @@ local function ensure_spacer(section)
     ui_state.spacer_win = vim.api.nvim_open_win(ui_state.spacer_buf, false, config)
   end
 
-  vim.api.nvim_win_set_option(ui_state.spacer_win, "winhl", "NormalFloat:NormalFloat")
+  vim.api.nvim_win_set_option(ui_state.spacer_win, "winhl", "Normal:EgrepSpacer")
+  vim.api.nvim_win_set_option(ui_state.spacer_win, "winblend", 0)
 end
 
 local function apply_layout()
@@ -886,35 +1097,57 @@ local function apply_layout()
 
   ensure_window('input_win', 'input_buf', sections.search, {
     enter_on_create = not (ui_state.input_win and vim.api.nvim_win_is_valid(ui_state.input_win)),
-    title = " Search ",
-    title_pos = "left",
-    winhl = "Normal:EgrepActiveInput,FloatBorder:FloatBorder,FloatTitle:FloatTitle",
+    border = "none",
+    winhl = "Normal:EgrepActiveInput,EndOfBuffer:EgrepActiveInput",
+    options = {
+      wrap = false,
+      number = false,
+      relativenumber = false,
+      signcolumn = "no",
+      foldcolumn = "0",
+    },
   })
 
   ensure_window('include_win', 'include_buf', sections.include, {
-    title = " Include ",
-    title_pos = "left",
-    winhl = "Normal:EgrepInactiveInput,FloatBorder:FloatBorder,FloatTitle:FloatTitle",
+    border = "none",
+    winhl = "Normal:EgrepInactiveInput,EndOfBuffer:EgrepInactiveInput",
+    options = {
+      wrap = false,
+      number = false,
+      relativenumber = false,
+      signcolumn = "no",
+      foldcolumn = "0",
+    },
   })
 
   ensure_window('exclude_win', 'exclude_buf', sections.exclude, {
-    title = " Exclude ",
-    title_pos = "left",
-    winhl = "Normal:EgrepInactiveInput,FloatBorder:FloatBorder,FloatTitle:FloatTitle",
-  })
-
-  ensure_window('options_win', 'options_buf', sections.options, {
-    title = " Quick Options ",
-    title_pos = "left",
-    winhl = "Normal:NormalFloat,FloatBorder:FloatBorder,FloatTitle:FloatTitle",
+    border = "none",
+    winhl = "Normal:EgrepInactiveInput,EndOfBuffer:EgrepInactiveInput",
     options = {
       wrap = false,
+      number = false,
+      relativenumber = false,
+      signcolumn = "no",
+      foldcolumn = "0",
+    },
+  })
+
+  ensure_window('status_win', 'status_buf', sections.status, {
+    border = "none",
+    winhl = "Normal:EgrepStatus",
+    options = {
+      wrap = false,
+      number = false,
+      relativenumber = false,
+      signcolumn = "no",
+      foldcolumn = "0",
     },
   })
 
   ensure_window('main_win', 'main_buf', sections.results, {
     title = " Results ",
     title_pos = "left",
+    winhl = "Normal:NormalFloat,FloatBorder:EgrepBorder",
     options = {
       wrap = false,
       cursorline = true,
@@ -924,18 +1157,35 @@ local function apply_layout()
   ensure_window('preview_win', 'preview_buf', sections.preview, {
     title = " Preview ",
     title_pos = "left",
+    winhl = "Normal:NormalFloat,FloatBorder:EgrepBorder",
     options = {
       wrap = false,
       number = true,
     },
   })
 
-  ensure_spacer(sections.spacer)
+  local spacer_height_limit
+  if sections.results and sections.spacer then
+    spacer_height_limit = sections.results.height + 3
+  end
+  local status_row = sections.status and sections.status.row or nil
+  if status_row and sections.spacer then
+    local to_status = status_row - sections.spacer.row
+    if to_status >= 1 then
+      if spacer_height_limit then
+        spacer_height_limit = math.min(spacer_height_limit, to_status)
+      else
+        spacer_height_limit = to_status
+      end
+    end
+  end
+  ensure_spacer(sections.spacer, spacer_height_limit)
 
   if ui_state.main_win and vim.api.nvim_win_is_valid(ui_state.main_win) then
     pcall(vim.api.nvim_win_set_option, ui_state.main_win, "winhighlight", "CursorLine:EgrepCursorLine")
   end
 
+  render_status_line()
   update_input_highlights()
 end
 
@@ -979,6 +1229,8 @@ function M.next_input()
     end
     vim.api.nvim_set_current_win(target)
     vim.cmd("startinsert!")
+    local target_buf = vim.api.nvim_win_get_buf(target)
+    move_input_cursor_to_end(target_buf, target)
   end
 
   update_input_highlights()
@@ -1028,6 +1280,8 @@ function M.prev_input()
     end
     vim.api.nvim_set_current_win(target)
     vim.cmd("startinsert!")
+    local target_buf = vim.api.nvim_win_get_buf(target)
+    move_input_cursor_to_end(target_buf, target)
   end
 
   update_input_highlights()
@@ -1040,12 +1294,13 @@ function M.toggle_include()
   ui_state.include_visible = not ui_state.include_visible
   apply_layout()
   ui_state.suppress_close_watch = false
-  render_options()
+  render_status_line()
 
   if ui_state.include_visible and ui_state.include_win and vim.api.nvim_win_is_valid(ui_state.include_win) then
     ui_state.manual_input_focus = true
     vim.api.nvim_set_current_win(ui_state.include_win)
     vim.cmd("startinsert!")
+    move_input_cursor_to_end(ui_state.include_buf, ui_state.include_win)
     update_input_highlights()
   else
     focus_search_input()
@@ -1058,12 +1313,13 @@ function M.toggle_exclude()
   ui_state.exclude_visible = not ui_state.exclude_visible
   apply_layout()
   ui_state.suppress_close_watch = false
-  render_options()
+  render_status_line()
 
   if ui_state.exclude_visible and ui_state.exclude_win and vim.api.nvim_win_is_valid(ui_state.exclude_win) then
     ui_state.manual_input_focus = true
     vim.api.nvim_set_current_win(ui_state.exclude_win)
     vim.cmd("startinsert!")
+    move_input_cursor_to_end(ui_state.exclude_buf, ui_state.exclude_win)
     update_input_highlights()
   else
     focus_search_input()
@@ -1079,7 +1335,7 @@ function M.toggle_no_tests()
   -- Don't modify the exclude input buffer - the toggle works behind the scenes
   -- The test patterns will be added during ripgrep command building
 
-  render_options()
+  render_status_line()
   if ui_state.current_search ~= "" then
     trigger_search(true)  -- Force search since toggles changed
   end
@@ -1092,7 +1348,7 @@ function M.toggle_ruby_only()
   -- Don't modify the include input buffer - the toggle works behind the scenes
   -- The Ruby pattern will be added during ripgrep command building
 
-  render_options()
+  render_status_line()
   if ui_state.current_search ~= "" then
     trigger_search(true)  -- Force search since toggles changed
   end
@@ -1102,7 +1358,7 @@ end
 function M.toggle_case_sensitive()
   local current = state.get()
   state.update({case_sensitive = not current.case_sensitive})
-  render_options()
+  render_status_line()
   if ui_state.current_search ~= "" then
     trigger_search(true)  -- Force search since toggles changed
   end
@@ -1111,59 +1367,121 @@ end
 --- Toggle show hidden files
 function M.toggle_show_hidden()
   ui_state.show_hidden = not ui_state.show_hidden
-  render_options()
+  render_status_line()
   if ui_state.current_search ~= "" then
     trigger_search(true)  -- Force search since toggles changed
   end
 end
 
 --- Render options line
-render_options = function()
-  if not ui_state.options_buf or not vim.api.nvim_buf_is_valid(ui_state.options_buf) then
+render_status_line = function()
+  if not ui_state.status_buf or not vim.api.nvim_buf_is_valid(ui_state.status_buf) then
     return
   end
 
   local current = state.get()
-  local no_tests_icon = current.ignore_tests and icons.checked or icons.unchecked
-  local ruby_only_icon = ui_state.ruby_only and icons.checked or icons.unchecked
-  local case_icon = current.case_sensitive and icons.checked or icons.unchecked
-  local hidden_icon = ui_state.show_hidden and icons.checked or icons.unchecked
-  local include_icon = ui_state.include_visible and icons.checked or icons.unchecked
-  local exclude_icon = ui_state.exclude_visible and icons.checked or icons.unchecked
 
-  local lines = {
-    string.format(
-      " %s Include Filters (%s)   %s Exclude Filters (%s)   Focus Search (%s)   Help (%s)",
-      include_icon,
-      display_key('toggle_include', 'F2'),
-      exclude_icon,
-      display_key('toggle_exclude', 'F3'),
-      display_key('focus_search', 'F1'),
-      display_key('show_help', '?')
-    ),
-    string.format(
-      " %s No Tests (%s)   %s Ruby Only (%s)   %s Case Sensitive (%s)   %s Show Hidden (%s)",
-      no_tests_icon,
-      display_key('toggle_no_tests', 'F4'),
-      ruby_only_icon,
-      display_key('toggle_ruby_only', 'F5'),
-      case_icon,
-      display_key('toggle_case_sensitive', 'F6'),
-      hidden_icon,
-      display_key('toggle_show_hidden', 'F7')
-    ),
-  }
+  local segments = {}
 
-  vim.api.nvim_buf_set_option(ui_state.options_buf, "modifiable", true)
-  vim.api.nvim_buf_set_lines(ui_state.options_buf, 0, -1, false, lines)
-  vim.api.nvim_buf_set_option(ui_state.options_buf, "modifiable", false)
+  local function add_segment(text)
+    if text and text ~= "" then
+      table.insert(segments, text)
+    end
+  end
+
+  local entries = {}
+
+  local function add_entry(text)
+    if text and text ~= "" then
+      table.insert(entries, text)
+    end
+  end
+
+  local function add_toggle_entry(active, label, key_name, always_visible)
+    local key = display_key(key_name, key_name)
+    if key == "" then
+      return
+    end
+    if not always_visible and not active then
+      return
+    end
+    local marker = active and "x" or " "
+    add_entry(string.format("[%s] %s(%s)", marker, label, key))
+  end
+
+  local help_key = display_key('show_help', '?')
+  if help_key ~= "" then
+    add_entry(string.format("%s Help", help_key))
+  end
+
+  local focus_key = display_key('focus_search', 'F1')
+  if focus_key ~= "" then
+    add_entry(string.format("Focus Search (%s)", focus_key))
+  end
+
+  add_toggle_entry(ui_state.include_visible, "Include Pattern", 'toggle_include', true)
+  add_toggle_entry(ui_state.exclude_visible, "Exclude Pattern", 'toggle_exclude', true)
+  add_toggle_entry(current.ignore_tests, "NoTests", 'toggle_no_tests', false)
+  add_toggle_entry(ui_state.ruby_only, "Ruby Only", 'toggle_ruby_only', false)
+  add_toggle_entry(current.case_sensitive, "Case Sensitive", 'toggle_case_sensitive', false)
+  add_toggle_entry(ui_state.show_hidden, "Hidden Files", 'toggle_show_hidden', false)
+
+  local total_width = ui_state.layout and ui_state.layout.width or nil
+  local separator = " │ "
+  local separator_width = str_width(separator)
+  local line = ""
+
+  for _, entry in ipairs(entries) do
+    local part = entry
+    local part_width = str_width(part)
+    local extra = (line ~= "") and separator_width or 0
+    if total_width and str_width(line) + extra + part_width > total_width then
+      if str_width(line) == 0 then
+        part = shorten_text(part, total_width)
+        line = part
+      end
+      break
+    end
+    if line ~= "" then
+      line = line .. separator
+    end
+    line = line .. part
+  end
+
+  if total_width then
+    local current_width = str_width(line)
+    if current_width < total_width then
+      line = line .. string.rep(" ", total_width - current_width)
+    elseif current_width == 0 then
+      line = string.rep(" ", total_width)
+    end
+  elseif line == "" then
+    line = " "
+  end
+
+  vim.api.nvim_buf_set_option(ui_state.status_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(ui_state.status_buf, 0, -1, false, {line})
+  vim.api.nvim_buf_set_option(ui_state.status_buf, "modifiable", false)
 end
 
 --- Show help
 function M.show_help()
+  if ui_state.help_win and vim.api.nvim_win_is_valid(ui_state.help_win) then
+    close_help_window()
+    return
+  end
+
   local help_text = {
     "Enhanced Grep Keybindings:",
     "",
+  }
+
+  if ui_state.backend_command and ui_state.backend_command ~= "" then
+    table.insert(help_text, 2, string.format("Backend command: %s", ui_state.backend_command))
+    table.insert(help_text, 3, "")
+  end
+
+  vim.list_extend(help_text, {
     "Input Navigation:",
     "  <Tab>/<C-n>    - Next input field",
     "  <S-Tab>/<C-p>  - Previous input field",
@@ -1199,9 +1517,49 @@ function M.show_help()
     "  - Preview updates as you navigate results",
     "  - Files are collapsed by default (press Right arrow to expand)",
     "  - Quick option toggles work in both insert and normal mode",
-  }
+  })
 
-  vim.notify(table.concat(help_text, "\n"), vim.log.levels.INFO, {title = "Enhanced Grep Help"})
+  local longest = 0
+  for _, line in ipairs(help_text) do
+    longest = math.max(longest, str_width(line))
+  end
+
+  local padding = 4
+  local desired_width = math.max(40, math.min(longest, vim.o.columns - 10))
+  local win_width = math.min(desired_width + padding, vim.o.columns - 4)
+  local desired_height = #help_text
+  local win_height = math.min(desired_height + 2, vim.o.lines - 4)
+
+  if not ui_state.help_buf or not vim.api.nvim_buf_is_valid(ui_state.help_buf) then
+    ui_state.help_buf = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_option(ui_state.help_buf, "bufhidden", "wipe")
+    vim.api.nvim_buf_set_option(ui_state.help_buf, "filetype", "egrephelp")
+  end
+
+  vim.api.nvim_buf_set_option(ui_state.help_buf, "modifiable", true)
+  vim.api.nvim_buf_set_lines(ui_state.help_buf, 0, -1, false, help_text)
+  vim.api.nvim_buf_set_option(ui_state.help_buf, "modifiable", false)
+
+  local row = math.max(math.floor((vim.o.lines - win_height) / 2), 0)
+  local col = math.max(math.floor((vim.o.columns - win_width) / 2), 0)
+
+  ui_state.help_win = vim.api.nvim_open_win(ui_state.help_buf, false, {
+    relative = "editor",
+    row = row,
+    col = col,
+    width = win_width,
+    height = win_height,
+    style = "minimal",
+    border = FLOAT_BORDER,
+    focusable = true,
+    zindex = 150,
+  })
+
+  vim.api.nvim_win_set_option(ui_state.help_win, "wrap", true)
+  vim.api.nvim_win_set_option(ui_state.help_win, "winhl", "NormalFloat:NormalFloat,FloatBorder:EgrepBorder")
+
+  vim.keymap.set({'n', 'i'}, '<Esc>', close_help_window, {buffer = ui_state.help_buf, nowait = true})
+  vim.keymap.set({'n', 'i'}, 'q', close_help_window, {buffer = ui_state.help_buf, nowait = true})
 end
 
 --- Trigger search from inputs
@@ -1216,23 +1574,9 @@ trigger_search = function(force)
   local prev_include = ui_state.current_include
   local prev_exclude = ui_state.current_exclude
 
-  -- Get search pattern
-  local pattern_lines = vim.api.nvim_buf_get_lines(ui_state.input_buf, 0, 1, false)
-  local pattern = (pattern_lines[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
-
-  -- Get include patterns (from line 2, index 1)
-  local include_str = ""
-  if ui_state.include_buf and vim.api.nvim_buf_is_valid(ui_state.include_buf) then
-    local include_lines = vim.api.nvim_buf_get_lines(ui_state.include_buf, 0, 1, false)
-    include_str = (include_lines[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  end
-
-  -- Get exclude patterns (from line 2, index 1)
-  local exclude_str = ""
-  if ui_state.exclude_buf and vim.api.nvim_buf_is_valid(ui_state.exclude_buf) then
-    local exclude_lines = vim.api.nvim_buf_get_lines(ui_state.exclude_buf, 0, 1, false)
-    exclude_str = (exclude_lines[1] or ""):gsub("^%s+", ""):gsub("%s+$", "")
-  end
+  local pattern = get_input_value(ui_state.input_buf)
+  local include_str = get_input_value(ui_state.include_buf)
+  local exclude_str = get_input_value(ui_state.exclude_buf)
 
   -- Check if anything changed (unless force is true)
   if not force and pattern == prev_search and include_str == prev_include and exclude_str == prev_exclude then
@@ -1333,23 +1677,26 @@ local function setup_input_keymaps(buf)
       vim.tbl_extend("force", keymap[4], {buffer = buf, nowait = true}))
   end
 
-  local opts = {buffer = buf, nowait = true}
-  map_config_key({'n', 'i'}, 'focus_search', focus_search_input,
-    vim.tbl_extend("force", {desc = "Focus search input"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_include', M.toggle_include,
-    vim.tbl_extend("force", {desc = "Toggle include filters"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_exclude', M.toggle_exclude,
-    vim.tbl_extend("force", {desc = "Toggle exclude filters"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_no_tests', M.toggle_no_tests,
-    vim.tbl_extend("force", {desc = "Toggle no tests filter"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_ruby_only', M.toggle_ruby_only,
-    vim.tbl_extend("force", {desc = "Toggle Ruby only filter"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_case_sensitive', M.toggle_case_sensitive,
-    vim.tbl_extend("force", {desc = "Toggle case sensitive"}, opts))
-  map_config_key({'n', 'i'}, 'toggle_show_hidden', M.toggle_show_hidden,
-    vim.tbl_extend("force", {desc = "Toggle show hidden files"}, opts))
-  map_config_key({'n', 'i'}, 'show_help', M.show_help,
-    vim.tbl_extend("force", {desc = "Show help"}, opts))
+  -- Only set up default keymaps if enabled
+  if ui_config.enable_default_keymaps ~= false then
+    local opts = {buffer = buf, nowait = true}
+    map_config_key({'n', 'i'}, 'focus_search', focus_search_input,
+      vim.tbl_extend("force", {desc = "Focus search input"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_include', M.toggle_include,
+      vim.tbl_extend("force", {desc = "Toggle include filters"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_exclude', M.toggle_exclude,
+      vim.tbl_extend("force", {desc = "Toggle exclude filters"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_no_tests', M.toggle_no_tests,
+      vim.tbl_extend("force", {desc = "Toggle no tests filter"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_ruby_only', M.toggle_ruby_only,
+      vim.tbl_extend("force", {desc = "Toggle Ruby only filter"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_case_sensitive', M.toggle_case_sensitive,
+      vim.tbl_extend("force", {desc = "Toggle case sensitive"}, opts))
+    map_config_key({'n', 'i'}, 'toggle_show_hidden', M.toggle_show_hidden,
+      vim.tbl_extend("force", {desc = "Toggle show hidden files"}, opts))
+    map_config_key({'n', 'i'}, 'show_help', M.show_help,
+      vim.tbl_extend("force", {desc = "Show help"}, opts))
+  end
 end
 
 --- Create the unified picker UI with preview pane
@@ -1365,6 +1712,8 @@ function M.create_picker(opts)
   ui_state.exclude_visible = false
   ui_state.manual_input_focus = false
   ui_state.origin_win = vim.api.nvim_get_current_win()
+  ui_state.input_prefixes = {}
+  ui_state.backend_command = nil
 
   local default_pattern = opts.default_pattern or ""
 
@@ -1385,7 +1734,8 @@ function M.create_picker(opts)
   vim.api.nvim_buf_set_option(ui_state.input_buf, "buftype", "")
   vim.api.nvim_buf_set_option(ui_state.input_buf, "modifiable", true)
   vim.api.nvim_buf_set_option(ui_state.input_buf, "swapfile", false)
-  vim.api.nvim_buf_set_lines(ui_state.input_buf, 0, -1, false, {default_pattern})
+  set_input_buffer_content(ui_state.input_buf, "Search", default_pattern or "")
+  attach_input_behavior(ui_state.input_buf)
 
   -- Include patterns buffer
   local include_default = patterns.format_patterns(ui_state.include_patterns) or ""
@@ -1394,7 +1744,8 @@ function M.create_picker(opts)
   vim.api.nvim_buf_set_option(ui_state.include_buf, "buftype", "")
   vim.api.nvim_buf_set_option(ui_state.include_buf, "modifiable", true)
   vim.api.nvim_buf_set_option(ui_state.include_buf, "swapfile", false)
-  vim.api.nvim_buf_set_lines(ui_state.include_buf, 0, -1, false, {include_default})
+  set_input_buffer_content(ui_state.include_buf, "Include", include_default)
+  attach_input_behavior(ui_state.include_buf)
 
   -- Exclude patterns buffer
   local exclude_default = patterns.format_patterns(ui_state.exclude_patterns) or ""
@@ -1403,13 +1754,15 @@ function M.create_picker(opts)
   vim.api.nvim_buf_set_option(ui_state.exclude_buf, "buftype", "")
   vim.api.nvim_buf_set_option(ui_state.exclude_buf, "modifiable", true)
   vim.api.nvim_buf_set_option(ui_state.exclude_buf, "swapfile", false)
-  vim.api.nvim_buf_set_lines(ui_state.exclude_buf, 0, -1, false, {exclude_default})
+  set_input_buffer_content(ui_state.exclude_buf, "Exclude", exclude_default)
+  attach_input_behavior(ui_state.exclude_buf)
 
-  -- Quick options buffer
-  ui_state.options_buf = vim.api.nvim_create_buf(false, true)
-  vim.api.nvim_buf_set_option(ui_state.options_buf, "bufhidden", "hide")
-  vim.api.nvim_buf_set_option(ui_state.options_buf, "modifiable", false)
-  vim.api.nvim_buf_set_option(ui_state.options_buf, "swapfile", false)
+  -- Input frame buffer
+  -- Status line buffer
+  ui_state.status_buf = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_buf_set_option(ui_state.status_buf, "bufhidden", "hide")
+  vim.api.nvim_buf_set_option(ui_state.status_buf, "modifiable", false)
+  vim.api.nvim_buf_set_option(ui_state.status_buf, "swapfile", false)
 
   -- Results buffer
   ui_state.main_buf = vim.api.nvim_create_buf(false, true)
@@ -1444,20 +1797,16 @@ function M.create_picker(opts)
     col = col,
     width = total_width,
     height = total_height,
-    results_ratio = layout_overrides.results_ratio or layout_defaults.results_ratio or 0.55,
+    results_ratio = layout_overrides.results_ratio or layout_defaults.results_ratio or 0.5,
     horizontal_gap = layout_overrides.horizontal_gap or layout_defaults.horizontal_gap or 1,
     vertical_gap = layout_overrides.vertical_gap or layout_defaults.vertical_gap or 0,
-    options_height = layout_overrides.options_height or layout_defaults.options_height or 2,
     min_results_height = min_results_height,
-    search_height = 2,
-    filter_height = 2,
   }
 
   apply_layout()
 
   if ui_state.input_win and vim.api.nvim_win_is_valid(ui_state.input_win) then
-    local cursor_col = #default_pattern
-    vim.api.nvim_win_set_cursor(ui_state.input_win, {1, cursor_col})
+    move_input_cursor_to_end(ui_state.input_buf, ui_state.input_win)
   end
 
   if ui_state.main_win and vim.api.nvim_win_is_valid(ui_state.main_win) then
@@ -1468,15 +1817,18 @@ function M.create_picker(opts)
     if not buf or not vim.api.nvim_buf_is_valid(buf) then
       return
     end
-    local base_opts = {buffer = buf, nowait = true}
-    map_config_key(modes, 'focus_search', focus_search_input, vim.tbl_extend("force", {desc = "Focus search input"}, base_opts))
-    map_config_key(modes, 'toggle_include', M.toggle_include, vim.tbl_extend("force", {desc = "Toggle include filters"}, base_opts))
-    map_config_key(modes, 'toggle_exclude', M.toggle_exclude, vim.tbl_extend("force", {desc = "Toggle exclude filters"}, base_opts))
-    map_config_key(modes, 'toggle_no_tests', M.toggle_no_tests, vim.tbl_extend("force", {desc = "Toggle no tests filter"}, base_opts))
-    map_config_key(modes, 'toggle_ruby_only', M.toggle_ruby_only, vim.tbl_extend("force", {desc = "Toggle Ruby only filter"}, base_opts))
-    map_config_key(modes, 'toggle_case_sensitive', M.toggle_case_sensitive, vim.tbl_extend("force", {desc = "Toggle case sensitive search"}, base_opts))
-    map_config_key(modes, 'toggle_show_hidden', M.toggle_show_hidden, vim.tbl_extend("force", {desc = "Toggle show hidden files"}, base_opts))
-    map_config_key(modes, 'show_help', M.show_help, vim.tbl_extend("force", {desc = "Show help"}, base_opts))
+    -- Only set up default keymaps if enabled
+    if ui_config.enable_default_keymaps ~= false then
+      local base_opts = {buffer = buf, nowait = true}
+      map_config_key(modes, 'focus_search', focus_search_input, vim.tbl_extend("force", {desc = "Focus search input"}, base_opts))
+      map_config_key(modes, 'toggle_include', M.toggle_include, vim.tbl_extend("force", {desc = "Toggle include filters"}, base_opts))
+      map_config_key(modes, 'toggle_exclude', M.toggle_exclude, vim.tbl_extend("force", {desc = "Toggle exclude filters"}, base_opts))
+      map_config_key(modes, 'toggle_no_tests', M.toggle_no_tests, vim.tbl_extend("force", {desc = "Toggle no tests filter"}, base_opts))
+      map_config_key(modes, 'toggle_ruby_only', M.toggle_ruby_only, vim.tbl_extend("force", {desc = "Toggle Ruby only filter"}, base_opts))
+      map_config_key(modes, 'toggle_case_sensitive', M.toggle_case_sensitive, vim.tbl_extend("force", {desc = "Toggle case sensitive search"}, base_opts))
+      map_config_key(modes, 'toggle_show_hidden', M.toggle_show_hidden, vim.tbl_extend("force", {desc = "Toggle show hidden files"}, base_opts))
+      map_config_key(modes, 'show_help', M.show_help, vim.tbl_extend("force", {desc = "Show help"}, base_opts))
+    end
   end
 
   local main_keymaps = {
@@ -1547,7 +1899,6 @@ function M.create_picker(opts)
   end
 
   map_ui_keys_for_buffer(ui_state.main_buf, 'n')
-  map_ui_keys_for_buffer(ui_state.options_buf, 'n')
 
   local watch_group = vim.api.nvim_create_augroup("EgrepWindowWatch", {clear = true})
   vim.api.nvim_create_autocmd("WinClosed", {
@@ -1566,7 +1917,7 @@ function M.create_picker(opts)
         ui_state.input_win,
         ui_state.include_win,
         ui_state.exclude_win,
-        ui_state.options_win,
+        ui_state.status_win,
         ui_state.main_win,
         ui_state.preview_win,
         ui_state.spacer_win,
@@ -1609,7 +1960,7 @@ function M.create_picker(opts)
     end,
   })
 
-  render_options()
+  render_status_line()
   M.render_results({})
   update_preview(nil, nil)
   update_input_highlights()
@@ -1617,6 +1968,11 @@ function M.create_picker(opts)
   vim.cmd("startinsert!")
 
   return ui_state.input_buf, ui_state.main_buf
+end
+
+function M.set_backend_command(cmd)
+  ui_state.backend_command = cmd
+  render_status_line()
 end
 
 -- Setup highlights on load

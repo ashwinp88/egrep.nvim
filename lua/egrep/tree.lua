@@ -134,23 +134,50 @@ function M.build_nodes(results, folder_state)
       -- Build match nodes if expanded
       local match_nodes = {}
       if is_expanded then
+        local display_limit = 160
         for _, match in ipairs(node.matches) do
-          local match_text = string.format("L%d: %s",
-            match.line_number,
-            match.text:gsub("^%s+", ""):gsub("%s+$", "")
-          )
+          local raw_line = (match.text or ""):gsub("\n$", "")
+          local leading = raw_line:match("^%s*") or ""
+          local leading_len = #leading
+          local trimmed_line = raw_line:gsub("^%s+", "")
+          local display_line = trimmed_line
+          local truncated = false
+          if #display_line > display_limit then
+            display_line = display_line:sub(1, display_limit - 3)
+            truncated = true
+          end
 
-          -- Truncate long lines
-          if #match_text > 80 then
-            match_text = match_text:sub(1, 77) .. "..."
+          local adjusted_submatches = {}
+          for _, sub in ipairs(match.submatches or {}) do
+            if sub.start and sub["end"] then
+              local start_idx = sub.start - leading_len
+              local end_idx = sub["end"] - leading_len
+              if start_idx < display_limit then
+                start_idx = math.max(start_idx, 0)
+                local limit = truncated and (display_limit - 3) or #display_line
+                local finish_idx = math.min(end_idx, limit)
+                if finish_idx > start_idx then
+                  table.insert(adjusted_submatches, {
+                    start = start_idx,
+                    finish = finish_idx,
+                  })
+                end
+              end
+            end
+          end
+
+          if truncated then
+            display_line = display_line .. "..."
           end
 
           local match_node = NuiTree.Node({
-            text = match_text,
+            text = string.format("L%d: %s", match.line_number, display_line),
             type = "match",
             file = node.path,
             line_number = match.line_number,
             column = match.column,
+            submatches = adjusted_submatches,
+            match_text = display_line,
           })
 
           table.insert(match_nodes, match_node)
@@ -198,12 +225,12 @@ function M.create_prepare_node()
     local line = NuiLine()
     local indent = string.rep("  ", node:get_depth() - 1)
 
-    line:append(indent)
+    line:append(indent, "EgrepGuide")
 
     if node.type == "folder" then
       -- Render folder
       local fold_icon = node:is_expanded() and icons.folder_open or icons.folder_closed
-      line:append(fold_icon .. " ", "EgrepIcon")
+      line:append(fold_icon .. " ", "EgrepGuide")
       line:append(node.text, "EgrepFile")
 
     elseif node.type == "file" then
@@ -211,7 +238,7 @@ function M.create_prepare_node()
       local fold_icon = node:is_expanded() and icons.file_expanded or icons.file_collapsed
       local file_icon = get_file_icon(node.filename or node.text)
 
-      line:append(fold_icon .. " ", "Special")
+      line:append(fold_icon .. " ", "EgrepGuide")
       if file_icon ~= "" then
         line:append(file_icon .. " ", "EgrepIcon")
       end
@@ -219,15 +246,40 @@ function M.create_prepare_node()
 
     elseif node.type == "match" then
       -- Render match line
-      line:append(icons.match, "Comment")
+      line:append(icons.match, "EgrepGuide")
 
       -- Split text into line number and match content
       local line_nr, match_text = node.text:match("^(L%d+:)%s*(.*)$")
       if line_nr then
-        line:append(line_nr .. " ", "EgrepLineNr")
-        line:append(match_text, "EgrepMatch")
+        line:append(line_nr .. " ", "EgrepGuide")
+        local submatches = node.submatches or {}
+        if #submatches == 0 then
+          line:append(match_text, "EgrepMatchText")
+        else
+          local last_index = 1
+          for _, sub in ipairs(submatches) do
+            local start_col = sub.start + 1
+            local end_col = sub.finish
+            if start_col > #match_text then
+              break
+            end
+            if start_col > last_index then
+              line:append(match_text:sub(last_index, start_col - 1), "EgrepMatchText")
+            end
+            if end_col >= start_col then
+              if end_col > #match_text then
+                end_col = #match_text
+              end
+              line:append(match_text:sub(start_col, end_col), "EgrepMatchHighlight")
+              last_index = end_col + 1
+            end
+          end
+          if last_index <= #match_text then
+            line:append(match_text:sub(last_index), "EgrepMatchText")
+          end
+        end
       else
-        line:append(node.text, "EgrepMatch")
+        line:append(node.text, "EgrepMatchText")
       end
     end
 
